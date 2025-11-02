@@ -1,0 +1,44 @@
+version: "3.8"
+
+services:
+  admin_bot:
+    build: .
+    container_name: support_admin_bot
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      BOT_TYPE: "admin"
+      TELEGRAM_TOKEN_ADMIN: ${TELEGRAM_TOKEN_ADMIN}
+      TELEGRAM_TOKEN_CLIENT: ${TELEGRAM_TOKEN_CLIENT}
+      INITIAL_ADMIN_ID: ${INITIAL_ADMIN_ID}
+      SUPPORT_EMAIL: ${SUPPORT_EMAIL}
+      DB_PATH: "/data/support_bot.db"
+      HASH_SALT: ${HASH_SALT}
+    volumes:
+      - ./data:/data
+    networks:
+      - supportnet
+
+  client_bot:
+    build: .
+    container_name: support_client_bot
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      BOT_TYPE: "client"
+      TELEGRAM_TOKEN_ADMIN: ${TELEGRAM_TOKEN_ADMIN}
+      TELEGRAM_TOKEN_CLIENT: ${TELEGRAM_TOKEN_CLIENT}
+      INITIAL_ADMIN_ID: ${INITIAL_ADMIN_ID}
+      SUPPORT_EMAIL: ${SUPPORT_EMAIL}
+      DB_PATH: "/data/support_bot.db"
+      HASH_SALT: ${HASH_SALT}
+    volumes:
+      - ./data:/data
+    networks:
+      - supportnet
+
+networks:
+  supportnet:
+    driver: bridge
