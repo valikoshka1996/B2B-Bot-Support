@@ -106,4 +106,19 @@ def delete_client(session: Session, tg_id: str):
     session.delete(c)
     session.commit()
     return True
-    
+ 
+def get_company_history(session: Session, company_id: int):
+    """
+    Повертає всі повідомлення по компанії (за client.company_id),
+    відсортовані за часом.
+    """
+    from .models import Message, Client
+
+    q = (
+        session.query(Message)
+        .join(Client, Client.tg_id == Message.client_tg_id)
+        .filter(Client.company_id == company_id)
+        .order_by(Message.created_at.asc())
+    )
+    return q.all()
+

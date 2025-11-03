@@ -5,14 +5,14 @@ from telegram import BotCommand
 from sqlalchemy import exists
 
 load_dotenv()
-
+from telegram.error import TimedOut, RetryAfter, NetworkError
 from telegram.helpers import escape_markdown
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ConversationHandler
 from .db import SessionLocal
 from .models import Admin, Company, Client, Message, Claim
 from .utils import init_db, add_admin, add_company, add_client
-from .utils import update_admin, delete_admin, update_company, delete_company, update_client, delete_client
+from .utils import update_admin, delete_admin, update_company, delete_company, update_client, delete_client, get_company_history
 
 import logging
 
@@ -51,6 +51,8 @@ async def start_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📬 Необроблені повідомлення", callback_data="unprocessed")],   # <- додано
         [InlineKeyboardButton("🏢 Компанії", callback_data="companies_menu")],
         [InlineKeyboardButton("👥 Клієнти", callback_data="clients_menu")],
+        [InlineKeyboardButton("🕓 Історія комунікацій", callback_data="history_menu")],
+
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Адмін-панель:", reply_markup=reply_markup)
@@ -167,6 +169,58 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 except Exception as e:
                     logger.warning(f"⚠️ Не вдалося надіслати необроблене повідомлення {msg.id} адміну {tg_id}: {e}")
 
+        finally:
+            session.close()
+
+
+    elif data == "history_menu":
+        session = SessionLocal()
+        try:
+            companies = session.query(Company).all()
+            if not companies:
+                await query.message.reply_text("📭 Немає компаній для перегляду історії.")
+                return
+
+            keyboard = []
+            for comp in companies:
+                keyboard.append([InlineKeyboardButton(f"{comp.name}", callback_data=f"view_history:{comp.id}")])
+
+            keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
+            await query.message.reply_text("🕓 Оберіть компанію для перегляду історії:", reply_markup=InlineKeyboardMarkup(keyboard))
+        finally:
+            session.close()
+
+    elif data.startswith("view_history:"):
+        company_id = int(data.split(":")[1])
+        session = SessionLocal()
+        try:
+            company = session.query(Company).filter_by(id=company_id).first()
+            if not company:
+                await query.message.reply_text("❌ Компанію не знайдено.")
+                return
+
+            from app.utils import get_company_history
+            messages = get_company_history(session, company_id)
+            if not messages:
+                await query.message.reply_text(f"📭 У компанії <b>{company.name}</b> немає історії повідомлень.", parse_mode="HTML")
+                return
+
+            text = f"<b>🕓 Історія повідомлень компанії {company.name}</b>\n\n"
+            for msg in messages[-50:]:
+                sender = "👤 Клієнт" if msg.direction == "in" else "🛠️ Адмін"
+                recipient = "🛠️ Адміну" if msg.direction == "in" else "👤 Клієнту"
+                text += (
+                    f"<b>{sender} → {recipient}</b>\n"
+                    f"<i>{msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}</i>\n"
+                    f"{msg.text or '(без тексту)'}\n"
+                    f"────────────────────\n"
+                )
+
+            await query.message.reply_text(text[:4000], parse_mode="HTML")
+
+        except Exception as e:
+            logger.error(f"Помилка при перегляді історії компанії {company_id}: {e}")
+            await query.message.reply_text("⚠️ Помилка при отриманні історії.")
         finally:
             session.close()
 
@@ -571,8 +625,10 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         session.commit()
 
         client_bot = Bot(token=os.getenv("TELEGRAM_TOKEN_CLIENT"))
-        if media_path and os.path.exists(media_path):
-            try:
+
+        try:
+            # === ВІДПРАВКА МЕДІА ===
+            if media_path and os.path.exists(media_path):
                 with open(media_path, "rb") as f:
                     if file_type == "photo":
                         await client_bot.send_photo(chat_id=int(client_tg_id), photo=f, caption=f"💬 Відповідь від менеджера:\n{text or '(без тексту)'}")
@@ -584,11 +640,35 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         await client_bot.send_voice(chat_id=int(client_tg_id), voice=f, caption="💬 Відповідь від менеджера.")
                 logger.info(f"🗑️ Видаляю медіа після відправки: {media_path}")
                 os.remove(media_path)
-            except Exception as e:
-                logger.warning(f"⚠️ Помилка при видаленні {media_path}: {e}")
-        else:
-            await client_bot.send_message(chat_id=int(client_tg_id), text=f"💬 Відповідь від менеджера:\n{text}")
+            else:
+                # === ВІДПРАВКА ТЕКСТУ ===
+                await client_bot.send_message(chat_id=int(client_tg_id), text=f"💬 Відповідь від менеджера:\n{text}")
 
+        # === ОБРОБКА ПОМИЛОК TELEGRAM API ===
+        except TimedOut:
+            logger.warning(f"⚠️ Telegram API timeout при надсиланні клієнту {client_tg_id}. Повтор через 5 секунд.")
+            await asyncio.sleep(5)
+            try:
+                await client_bot.send_message(chat_id=int(client_tg_id), text=f"💬 Відповідь від менеджера (повторна спроба):\n{text}")
+            except Exception as e:
+                logger.error(f"❌ Повторна спроба не вдалася: {e}")
+
+        except RetryAfter as e:
+            delay = int(getattr(e, 'retry_after', 5))
+            logger.warning(f"⚠️ Перевищено ліміт запитів. Чекаю {delay} секунд перед повтором.")
+            await asyncio.sleep(delay)
+            try:
+                await client_bot.send_message(chat_id=int(client_tg_id), text=f"💬 Відповідь від менеджера:\n{text}")
+            except Exception as e:
+                logger.error(f"❌ Повтор після RateLimit не вдався: {e}")
+
+        except NetworkError:
+            logger.warning(f"🌐 Проблема з мережею під час відправки клієнту {client_tg_id}. Повідомлення пропущено.")
+
+        except Exception as e:
+            logger.exception(f"❌ Помилка при надсиланні клієнту {client_tg_id}: {e}")
+
+        # --- Відповідь адміну ---
         await update.message.reply_text("✅ Відповідь надіслана клієнту.")
         context.user_data.pop("replying_claim_id", None)
 
@@ -597,7 +677,6 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⚠️ Сталася помилка при надсиланні.")
     finally:
         session.close()
-
 
 # callback handler for "Відповісти" (claim)
 async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
