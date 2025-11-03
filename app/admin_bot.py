@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 from telegram import BotCommand
 from sqlalchemy import exists
-
+import asyncio
 load_dotenv()
 from telegram.error import TimedOut, RetryAfter, NetworkError
 from telegram.helpers import escape_markdown
@@ -35,6 +35,221 @@ init_db(initial_admin_tg_id=INITIAL_ADMIN)
 ASK_CONTACT = 1
 
 ASK_ADMIN_ID, ASK_ADMIN_NAME, ASK_ADMIN_SUPER = range(3)
+ASK_BROADCAST_TEXT = 200
+ASK_BROADCAST_CONFIRM = 201
+
+
+#повторні спроби та обробка помилок
+async def safe_send(client_bot: Bot, send_coro_callable, *args, retry=1, delay_on_timeout=5, **kwargs):
+    """
+    send_coro_callable — корутина-заглушка типу client_bot.send_message або send_photo (функція, не виклик!)
+    Викликається як: await safe_send(bot, bot.send_message, chat_id, text=..., retry=2)
+    Повертає True якщо успішно, False якщо провалилися всі спроби.
+    """
+    try_count = 0
+    while True:
+        try:
+            await send_coro_callable(*args, **kwargs)
+            return True
+        except RetryAfter as e:
+            delay = int(getattr(e, "retry_after", 5))
+            logger.warning(f"RateLimit — чекаю {delay}s")
+            await asyncio.sleep(delay)
+            try_count += 1
+        except TimedOut:
+            logger.warning(f"TimedOut при відправці, спробую через {delay_on_timeout}s")
+            await asyncio.sleep(delay_on_timeout)
+            try_count += 1
+        except NetworkError:
+            logger.warning("NetworkError при відправці — пропускаю цей контакт")
+            return False
+        except Exception as e:
+            logger.exception(f"Несподівана помилка при відправці: {e}")
+            return False
+
+        if try_count > retry:
+            logger.error("Вичерпано кількість повторних спроб")
+            return False
+
+# Додаємо функцію, яка зловить текст або медіа від адміна — зберігає у context.user_data["broadcast"] та запитує підтвердження:
+async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Отримуємо від адміна текст або медіа (photo/document/video/voice/audio).
+    Зберігаємо в context.user_data['broadcast'] = {text, file_id, file_type, media_path (temp) }
+    Питаємо ПІДТВЕРДИТИ/СКАСУВАТИ
+    """
+    tg_id = str(update.effective_user.id)
+    if not await ensure_is_admin(tg_id):
+        await update.message.reply_text("⛔ Ви не є адміністратором.")
+        return ConversationHandler.END
+
+    session = SessionLocal()
+    try:
+        # text може бути у caption або text
+        text = update.message.caption or update.message.text or None
+
+        file_id = None
+        file_type = None
+        if update.message.photo:
+            file_id = update.message.photo[-1].file_id
+            file_type = "photo"
+        elif update.message.document:
+            file_id = update.message.document.file_id
+            file_type = "document"
+        elif update.message.video:
+            file_id = update.message.video.file_id
+            file_type = "video"
+        elif update.message.voice:
+            file_id = update.message.voice.file_id
+            file_type = "voice"
+        elif update.message.audio:
+            file_id = update.message.audio.file_id
+            file_type = "audio"
+
+        # підготуємо структуру в контекст
+        bc = {"text": text, "file_id": file_id, "file_type": file_type, "media_path": None}
+        context.user_data["broadcast"] = bc
+
+        # Якщо є file_id — за бажання можна заздалегідь завантажити файл локально ОДИН раз,
+        # щоб потім розсилати з диску (ефективніше, ніж перезавантажувати file_id щоразу)
+        if file_id:
+            try:
+                bot = context.bot
+                file = await bot.get_file(file_id)
+                ext = {
+                    "photo": "jpg",
+                    "document": "dat",
+                    "video": "mp4",
+                    "voice": "ogg",
+                    "audio": "mp3"
+                }.get(file_type, "bin")
+                filename = f"broadcast_{file_type}_{int(datetime.utcnow().timestamp())}_{tg_id}.{ext}"
+                media_path = f"/data/media/{filename}"
+                os.makedirs("/data/media", exist_ok=True)
+                await file.download_to_drive(media_path)
+                bc["media_path"] = media_path
+                logger.info(f"📁 Broadcast media saved: {media_path}")
+            except Exception as e:
+                logger.warning(f"⚠️ Не вдалося зберегти файл для розсилки: {e}")
+                bc["media_path"] = None
+
+        # Питання на підтвердження
+        confirm_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Підтвердити і надіслати", callback_data="broadcast_confirm")],
+            [InlineKeyboardButton("❌ Скасувати", callback_data="broadcast_cancel")]
+        ])
+        summary = bc["text"] or "(без тексту)"
+        if bc["file_type"]:
+            summary += f"\n\n(з медіа: {bc['file_type']})"
+        await update.message.reply_text(f"📣 Підтвердіть розсилку:\n\n{summary}", reply_markup=confirm_kb)
+        return ASK_BROADCAST_CONFIRM
+
+    finally:
+        session.close()
+
+async def broadcast_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    tg_id = str(update.effective_user.id)
+    if not await ensure_is_admin(tg_id):
+        await q.message.reply_text("⛔ Ви не є адміністратором.")
+        return
+
+    bc = context.user_data.get("broadcast")
+    if not bc:
+        await q.message.reply_text("⚠️ Немає підготовленого повідомлення для розсилки.")
+        return
+
+    # Параметри розсилки
+    delay = float(os.getenv("BROADCAST_DELAY", "0.06"))  # сек між повідомленнями (налаштовувано)
+    client_token = os.getenv("TELEGRAM_TOKEN_CLIENT")
+    client_bot = Bot(token=client_token)
+
+    session = SessionLocal()
+    try:
+        clients = session.query(Client.tg_id).all()  # список кортежів
+        client_ids = [c[0] for c in clients]
+        total = len(client_ids)
+        await q.message.reply_text(f"🚀 Починаю розсилку на {total} клієнтів. Це може зайняти деякий час...")
+
+        sent = 0
+        failed = 0
+
+        # Відправка: відкриваємо локальний файл (якщо є), і для кожного клієнта посилаємо.
+        media_path = bc.get("media_path")
+        file_type = bc.get("file_type")
+        text = bc.get("text")
+
+        # Для економії: якщо media_path є — будемо відкривати файл щоразу в циклі
+        for cid in client_ids:
+            try:
+                # 1) зберегти запис у БД (direction='out') ПЕРЕД відправкою
+                m = Message(client_tg_id=str(cid), admin_tg_id=str(tg_id), direction="out",
+                            text=text, file_id=bc.get("file_id"), file_type=file_type,
+                            file_path=media_path, company_snapshot=None)
+                session.add(m)
+                session.commit()
+
+                # 2) відправка через safe_send
+                if media_path and os.path.exists(media_path):
+                    with open(media_path, "rb") as f:
+                        if file_type == "photo":
+                            ok = await safe_send(client_bot, client_bot.send_photo, chat_id=int(cid), photo=f, caption=f"📣 {text or ''}")
+                        elif file_type == "document":
+                            ok = await safe_send(client_bot, client_bot.send_document, chat_id=int(cid), document=f, caption=f"📣 {text or ''}")
+                        elif file_type == "video":
+                            ok = await safe_send(client_bot, client_bot.send_video, chat_id=int(cid), video=f, caption=f"📣 {text or ''}")
+                        elif file_type == "voice" or file_type == "audio":
+                            ok = await safe_send(client_bot, client_bot.send_voice if file_type == "voice" else client_bot.send_audio, chat_id=int(cid), voice=f if file_type=="voice" else None, audio=f if file_type=="audio" else None, caption=f"📣 {text or ''}")
+                        else:
+                            ok = await safe_send(client_bot, client_bot.send_message, chat_id=int(cid), text=f"📣 {text or ''}")
+                else:
+                    ok = await safe_send(client_bot, client_bot.send_message, chat_id=int(cid), text=f"📣 {text or ''}")
+
+                if ok:
+                    sent += 1
+                else:
+                    failed += 1
+
+            except Exception as e:
+                logger.exception(f"Помилка при розсилці клієнту {cid}: {e}")
+                failed += 1
+
+            # throttle
+            await asyncio.sleep(delay)
+
+        await q.message.reply_text(f"✅ Розсилка завершена. Відправлено: {sent}, помилок: {failed}")
+
+    finally:
+        # очистка: видаляємо тимчасовий файл тільки після завершення циклу
+        try:
+            if bc.get("media_path") and os.path.exists(bc.get("media_path")):
+                os.remove(bc.get("media_path"))
+                logger.info(f"🗑️ Видалено тимчасове медіа: {bc.get('media_path')}")
+        except Exception as e:
+            logger.warning(f"⚠️ Не вдалося видалити тимчасовий файл: {e}")
+
+        context.user_data.pop("broadcast", None)
+        session.close()
+#callback handlers для підтвердження / відміни. Додавши обробку broadcast_confirm та broadcast_cancel в admin_menu_callback або як глобальні CallbackQueryHandler — краще окремим handler-ом:
+
+async def broadcast_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    tg_id = str(update.effective_user.id)
+    if not await ensure_is_admin(tg_id):
+        await q.message.reply_text("⛔ Ви не є адміністратором.")
+        return
+    # видаляємо тимчасовий файл якщо є
+    bc = context.user_data.pop("broadcast", None)
+    if bc and bc.get("media_path"):
+        try:
+            if os.path.exists(bc["media_path"]):
+                os.remove(bc["media_path"])
+        except Exception:
+            pass
+    await q.message.reply_text("❌ Розсилка скасована.")
+
 
 # --- Меню ---
 async def start_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -52,6 +267,8 @@ async def start_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🏢 Компанії", callback_data="companies_menu")],
         [InlineKeyboardButton("👥 Клієнти", callback_data="clients_menu")],
         [InlineKeyboardButton("🕓 Історія комунікацій", callback_data="history_menu")],
+        [InlineKeyboardButton("📣 МАССОВА РОЗСИЛКА", callback_data="broadcast")],
+
 
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -121,6 +338,19 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")],
         ]
         await query.message.reply_text("🏢 Меню компаній:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # --- Массова розсилка ---
+    elif data == "broadcast":
+        await query.message.reply_text(
+            "📣 Введіть текст повідомлення **або** надішліть медіа з підписом, яке потрібно розіслати всім клієнтам.\n\n"
+            "Після надсилання натисніть ПІДТВЕРДИТИ або /cancel для скасування.",
+            parse_mode="Markdown"
+        )
+        context.user_data["action"] = "broadcast"
+        # очищаємо попередні дані
+        context.user_data.pop("broadcast", None)
+        return ASK_BROADCAST_TEXT
+
 
     # --- Необроблені повідомлення ---
     elif data == "unprocessed":
@@ -1043,6 +1273,25 @@ def run_admin_bot():
 
     # --- 👥 Адмінські команди ---
     app.add_handler(CommandHandler("list_admins", list_admins))
+    # у run_admin_bot(), перед MEDIA MessageHandler:
+    # --- 📣 Блок розсилки ---
+    broadcast_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_menu_callback, pattern="^broadcast$")],
+        states={
+            ASK_BROADCAST_TEXT: [MessageHandler(
+                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.VIDEO | filters.AUDIO | filters.Document.ALL)
+                & ~filters.COMMAND, handle_broadcast_input
+            )],
+            ASK_BROADCAST_CONFIRM: [
+                CallbackQueryHandler(broadcast_confirm_callback, pattern="^broadcast_confirm$"),
+                CallbackQueryHandler(broadcast_cancel_callback, pattern="^broadcast_cancel$")
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(broadcast_cancel_callback, pattern="^broadcast_cancel$")],
+        per_user=True,
+        per_chat=True
+    )
+    app.add_handler(broadcast_conv)
 
     # --- 📎 Обробка медіа та тексту ---
     MEDIA_FILTERS = (

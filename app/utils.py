@@ -122,3 +122,9 @@ def get_company_history(session: Session, company_id: int):
     )
     return q.all()
 
+def save_outgoing_message(session: Session, client_tg_id, admin_tg_id, text=None, file_path=None, file_type=None, company_snapshot=None):
+    m = Message(client_tg_id=str(client_tg_id), admin_tg_id=str(admin_tg_id), direction='out',
+                text=text, file_path=file_path, file_type=file_type, company_snapshot=company_snapshot)
+    session.add(m)
+    session.commit()
+    return m
