@@ -315,6 +315,11 @@ def safe_md2(value):
 
 # --- Виклик з меню ---
 async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # У самому початку admin_menu_callback
+    context.user_data.pop("action", None)
+    context.user_data.pop("broadcast", None)
+    context.user_data["broadcast_active"] = False
+
     query = update.callback_query
     await query.answer()
     data = query.data
