@@ -13,6 +13,7 @@ from .db import SessionLocal
 from .models import Admin, Company, Client, Message, Claim
 from .utils import init_db, add_admin, add_company, add_client
 from .utils import update_admin, delete_admin, update_company, delete_company, update_client, delete_client, get_company_history
+import inspect
 
 import logging
 
@@ -38,6 +39,287 @@ ASK_ADMIN_ID, ASK_ADMIN_NAME, ASK_ADMIN_SUPER = range(3)
 ASK_BROADCAST_TEXT = 200
 ASK_BROADCAST_CONFIRM = 201
 
+def log_tracepoint(tag: str, context: ContextTypes.DEFAULT_TYPE = None):
+    """Показує чіткий трек у консолі — хто викликав, де і з якими прапорцями."""
+    frame = inspect.stack()[1]
+    logger.info(
+        f"[TRACE] {tag} | caller={frame.function} | "
+        f"broadcast_active={context.user_data.get('broadcast_active')} | "
+        f"replying_claim_id={context.user_data.get('replying_claim_id')} | "
+        f"reply_mode_active={context.user_data.get('reply_mode_active')} | "
+        f"has_broadcast={bool(context.user_data.get('broadcast'))}"
+    )
+
+
+# ------------------- HANDLE BROADCAST INPUT -------------------
+
+
+# ------------------- HANDLE BROADCAST INPUT -------------------
+
+async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.text and update.message.text.strip().startswith("/cancel"):
+        return await broadcast_cancel_callback(update, context)
+    """Отримуємо текст або медіа для розсилки (з максимальним логуванням)."""
+    log_tracepoint("START handle_broadcast_input", context)
+
+    if context.user_data.get("reply_mode_active") or context.user_data.get("replying_claim_id"):
+        logger.warning("[BROADCAST_INPUT] IGNORE — адмін у режимі відповіді!")
+        return ConversationHandler.END
+
+    if not context.user_data.get("broadcast_active"):
+        logger.warning("[BROADCAST_INPUT] IGNORE — broadcast_active=False")
+        return ConversationHandler.END
+
+    tg_id = str(update.effective_user.id)
+    log_tracepoint("IS_ADMIN_CHECK", context)
+    if not await ensure_is_admin(tg_id):
+        await update.message.reply_text("⛔ Ви не є адміністратором.")
+        return ConversationHandler.END
+
+    session = SessionLocal()
+    try:
+        text = update.message.caption or update.message.text or None
+        file_id, file_type = None, None
+
+        if update.message.photo:
+            file_id = update.message.photo[-1].file_id
+            file_type = "photo"
+        elif update.message.document:
+            file_id = update.message.document.file_id
+            file_type = "document"
+        elif update.message.video:
+            file_id = update.message.video.file_id
+            file_type = "video"
+        elif update.message.voice:
+            file_id = update.message.voice.file_id
+            file_type = "voice"
+        elif update.message.audio:
+            file_id = update.message.audio.file_id
+            file_type = "audio"
+
+        bc = {"text": text, "file_id": file_id, "file_type": file_type, "media_path": None}
+        context.user_data["broadcast"] = bc
+        log_tracepoint(f"SET broadcast structure: {bc}", context)
+
+        if file_id:
+            try:
+                bot = context.bot
+                file = await bot.get_file(file_id)
+                ext = {
+                    "photo": "jpg", "document": "dat", "video": "mp4",
+                    "voice": "ogg", "audio": "mp3"
+                }.get(file_type, "bin")
+                filename = f"broadcast_{file_type}_{int(datetime.utcnow().timestamp())}_{tg_id}.{ext}"
+                media_path = f"/data/media/{filename}"
+                os.makedirs("/data/media", exist_ok=True)
+                await file.download_to_drive(media_path)
+                bc["media_path"] = media_path
+                logger.info(f"[BROADCAST_INPUT] 📁 Saved file: {media_path}")
+            except Exception as e:
+                logger.warning(f"[BROADCAST_INPUT] ⚠️ File save failed: {e}")
+
+        confirm_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Підтвердити і надіслати", callback_data="broadcast_confirm")],
+            [InlineKeyboardButton("❌ Скасувати", callback_data="broadcast_cancel")]
+        ])
+        summary = bc["text"] or "(без тексту)"
+        if bc["file_type"]:
+            summary += f"\n\n(з медіа: {bc['file_type']})"
+        log_tracepoint("SEND CONFIRM PROMPT", context)
+        await update.message.reply_text(f"📣 Підтвердіть розсилку:\n\n{summary}", reply_markup=confirm_kb)
+
+        log_tracepoint("END handle_broadcast_input", context)
+        return ASK_BROADCAST_CONFIRM
+    finally:
+        session.close()
+
+# ------------------- CLAIM CALLBACK -------------------
+
+async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробник кнопки 'Відповісти' — автоматично завершує активну розсилку перед переходом у режим відповіді."""
+    q = update.callback_query
+    await q.answer()
+
+    admin_tg = str(update.effective_user.id)
+    log_tracepoint("START claim_callback", context)
+
+    app = context.application
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # 💣 Якщо активна розсилка — знищуємо її сесію повністю
+    if context.user_data.get("broadcast_active") or context.user_data.get("broadcast"):
+        logger.info("💣 [CLAIM] Виявлено активний broadcast, примусово закриваю його перед переходом у режим відповіді.")
+
+        # очищення user_data
+        context.user_data.pop("broadcast_active", None)
+        context.user_data.pop("broadcast", None)
+
+        # шукаємо та видаляємо розмову broadcast_conv у PTB
+        for group in app.handlers.values():
+            for handler in group:
+                if isinstance(handler, ConversationHandler) and getattr(handler, "name", "") == "broadcast_conv":
+                    key = (chat_id, user_id)
+                    if hasattr(handler, "conversations") and key in handler.conversations:
+                        handler.conversations.pop(key, None)
+                        logger.info(f"🧹 [CLAIM] Broadcast conversation forcibly closed for {user_id}")
+
+        logger.info("✅ [CLAIM] Broadcast очищено перед взяттям запиту.")
+
+    # 💚 Тепер активуємо режим відповіді
+    context.user_data["reply_mode_active"] = True
+
+    data = q.data
+    if not data or not data.startswith("claim:"):
+        return
+
+    try:
+        msgid = int(data.split(":", 1)[1])
+    except Exception:
+        await q.message.reply_text("Неправильний формат запиту.")
+        return
+
+    session = SessionLocal()
+
+    try:
+        # знайти повідомлення
+        message = session.query(Message).filter_by(id=msgid).first()
+        if not message:
+            await q.message.reply_text("Повідомлення вже не знайдено.")
+            return
+
+        # перевірити чи вже є Claim по цьому message_id
+        existing = session.query(Claim).filter_by(message_id=msgid).first()
+        if existing:
+            admin_obj = session.query(Admin).filter_by(id=existing.admin_id).first()
+            admin_name = admin_obj.name if admin_obj else str(existing.admin_id)
+            await q.message.reply_text(f"⚠️ Запит вже взяв адміністратор {admin_name}")
+            return
+
+        # знайти адміна (того, хто натиснув кнопку)
+        admin_obj = session.query(Admin).filter_by(tg_id=admin_tg).first()
+        if not admin_obj:
+            await q.message.reply_text("❌ Ви не зареєстровані як адміністратор.")
+            return
+
+        # знайти клієнта (можливо None)
+        client_obj = session.query(Client).filter_by(tg_id=message.client_tg_id).first()
+
+        # створити Claim (використовуємо admin_id, client_id, message_id)
+        claim = Claim(
+            message_id=msgid,
+            client_id=client_obj.id if client_obj else None,
+            admin_id=admin_obj.id,
+            title=f"Запит від {client_obj.name if client_obj else message.client_tg_id}",
+            description=(message.text or "")[:4000],
+            status="in_progress"
+        )
+        session.add(claim)
+        session.commit()
+        session.refresh(claim)
+
+        # сповіщаємо інших адміністраторів
+        other_admins = session.query(Admin).filter(Admin.tg_id != admin_tg).all()
+        notify_text = f"🔒 Запит #{msgid} взяв адміністратор {admin_obj.name or admin_obj.tg_id}"
+        for a in other_admins:
+            try:
+                await context.bot.send_message(chat_id=int(a.tg_id), text=notify_text)
+            except Exception as e:
+                logger.warning(f"Can't notify admin {a.tg_id}: {e}")
+
+        # оновлюємо кнопку
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Взято ✅", callback_data="taken")]])
+        try:
+            await q.edit_message_reply_markup(reply_markup=keyboard)
+        except Exception as e:
+            logger.debug(f"edit_message_reply_markup failed: {e}")
+
+        # зберігаємо в контекст
+        context.user_data["replying_claim_id"] = claim.id
+
+        # 🟢 Повідомлення адміну
+        await context.bot.send_message(
+            chat_id=int(admin_tg),
+            text=(
+                f"🟢 Ви взяли запит #{msgid} від клієнта "
+                f"{client_obj.name if client_obj else message.client_tg_id}.\n\n"
+                f"✍️ Тепер просто напишіть повідомлення у цьому чаті — "
+                f"воно буде надіслано клієнту від вашого імені ({admin_obj.name or admin_tg})."
+            )
+        )
+
+        logger.info(f"✅ Admin {admin_tg} взяв claim #{claim.id}")
+
+    except Exception as e:
+        logger.exception(f"Error in claim_callback: {e}")
+        try:
+            await q.message.reply_text("⚠️ Сталася помилка під час обробки запиту.")
+        except Exception:
+            pass
+    finally:
+        session.close()
+
+# ------------------- START CLAIM FLOW -------------------
+
+async def start_claim_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Взяття запиту (з trace логами)."""
+    log_tracepoint("START start_claim_flow", context)
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    if not data or not data.startswith("claim:"):
+        logger.error("[CLAIM_FLOW] wrong callback data")
+        return ConversationHandler.END
+
+    try:
+        msgid = int(data.split(":", 1)[1])
+    except Exception:
+        await q.message.reply_text("Неправильний формат запиту.")
+        return ConversationHandler.END
+
+    admin_tg = str(update.effective_user.id)
+    session = SessionLocal()
+    try:
+        message = session.query(Message).filter_by(id=msgid).first()
+        if not message:
+            await q.message.reply_text("Повідомлення вже не знайдено.")
+            return ConversationHandler.END
+
+        existing = session.query(Claim).filter_by(message_id=msgid).first()
+        if existing:
+            logger.warning(f"[CLAIM_FLOW] already claimed {msgid}")
+            return ConversationHandler.END
+
+        admin_obj = session.query(Admin).filter_by(tg_id=admin_tg).first()
+        client_obj = session.query(Client).filter_by(tg_id=message.client_tg_id).first()
+
+        claim = Claim(
+            message_id=msgid,
+            client_id=client_obj.id if client_obj else None,
+            admin_id=admin_obj.id,
+            title=f"Запит від {client_obj.name if client_obj else message.client_tg_id}",
+            description=(message.text or "")[:4000],
+            status="in_progress"
+        )
+        session.add(claim)
+        session.commit()
+        session.refresh(claim)
+        log_tracepoint(f"[CLAIM_FLOW] created claim #{claim.id}", context)
+
+        context.user_data["replying_claim_id"] = claim.id
+
+        await context.bot.send_message(
+            chat_id=int(admin_tg),
+            text=(f"🟢 Ви взяли запит #{msgid} від {client_obj.name or message.client_tg_id}.\n\n"
+                  f"✍️ Тепер просто напишіть повідомлення — "
+                  f"воно буде надіслано клієнту від вашого імені.")
+        )
+
+        logger.info(f"[CLAIM_FLOW] ✅ claim ready #{claim.id}")
+        log_tracepoint("END start_claim_flow", context)
+        return ConversationHandler.END
+    finally:
+        session.close()
 
 # entry для broadcast — окрема проста функція, щоб ConversationHandler точно активувався
 async def start_broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -46,24 +328,39 @@ async def start_broadcast_callback(update: Update, context: ContextTypes.DEFAULT
     await q.answer()
 
     tg_id = str(update.effective_user.id)
+    app = context.application
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # 🔒 Перевіряємо адміністратора
     if not await ensure_is_admin(tg_id):
         await q.message.reply_text("⛔ Ви не є адміністратором.")
         return ConversationHandler.END
 
-    # повідомлення з інструкцією
+    # 💣 Насильно видаляємо стару сесію broadcast_conv, якщо зависла
+    for group in app.handlers.values():
+        for handler in group:
+            if isinstance(handler, ConversationHandler) and getattr(handler, "name", "") == "broadcast_conv":
+                if hasattr(handler, "conversations"):
+                    handler.conversations.pop((chat_id, user_id), None)
+                    logger.info(f"💣 [BROADCAST_RESET] Стару сесію broadcast_conv видалено для {user_id}")
+
+    # 🧹 Повністю очищаємо контекст користувача
+    context.user_data.clear()
+
+    # 🧩 Повідомлення з інструкцією
     await q.message.reply_text(
         "📣 Введіть текст повідомлення **або** надішліть медіа з підписом, яке потрібно розіслати всім клієнтам.\n\n"
-        "Після надсилання натисніть ПІДТВЕРДИТИ або натисніть ❌ Скасувати (/cancel).",
+        "Після надсилання натисніть ✅ ПІДТВЕРДИТИ або ❌",
         parse_mode="Markdown"
     )
 
-    # Не ставимо context.user_data['action']="broadcast" — нехай ConversationHandler керує потоком
-    # Очищаємо старі дані
-    context.user_data.pop("broadcast", None)
-    # Маркуємо, що зараз перебуваємо в режимі broadcast (не обов'язково, але зручно для логів)
     context.user_data["broadcast_active"] = True
+    logger.info("✅ [BROADCAST] Broadcast режим активовано (нова сесія).")
 
     return ASK_BROADCAST_TEXT
+
+
 
 
 #повторні спроби та обробка помилок
@@ -97,141 +394,6 @@ async def safe_send(client_bot: Bot, send_coro_callable, *args, retry=1, delay_o
         if try_count > retry:
             logger.error("Вичерпано кількість повторних спроб")
             return False
-
-# Додаємо функцію, яка зловить текст або медіа від адміна — зберігає у context.user_data["broadcast"] та запитує підтвердження:
-import asyncio
-
-async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробник кнопки 'Відповісти' — повністю скидає режим розсилки і запускає claim."""
-    q = update.callback_query
-    await q.answer()
-    admin_tg = str(update.effective_user.id)
-
-    # === 1️⃣ FORCE CANCEL BROADCAST (жорстке скасування) ===
-    if context.user_data.get("broadcast_active") or context.user_data.get("broadcast"):
-        logger.info("💣 Force cancelling broadcast перед взяттям claim.")
-
-        # 1. Видаляємо локальні дані broadcast
-        bc = context.user_data.pop("broadcast", None)
-        if bc and bc.get("media_path"):
-            try:
-                if os.path.exists(bc["media_path"]):
-                    os.remove(bc["media_path"])
-            except Exception:
-                pass
-        context.user_data.pop("broadcast_active", None)
-
-        # 2. Спробуємо завершити саму Conversation розсилки
-        app = context.application
-        chat_id = update.effective_chat.id
-        user_id = update.effective_user.id
-        try:
-            for handler in app.handlers.get(0, []):
-                if isinstance(handler, ConversationHandler):
-                    name = getattr(handler, "name", "")
-                    # Якщо handler стосується розсилки — закриваємо
-                    if "broadcast" in name.lower():
-                        conv_key = handler._get_key((chat_id, user_id))
-                        if conv_key in handler.conversations:
-                            handler.conversations.pop(conv_key, None)
-                            logger.info(f"🧹 Broadcast conversation forcibly ended for user {user_id}")
-        except Exception as e:
-            logger.debug(f"Broadcast conversation cleanup error: {e}")
-
-        # 3. Після цього більше нічого не відправляємо (жодних ❌ повідомлень)
-        logger.info("✅ Broadcast режим знищено без тригерів PTB.")
-
-    # === 2️⃣ Тепер безпечно активуємо режим відповіді ===
-    try:
-        result = await start_claim_flow(update, context)
-        context.user_data["reply_mode_active"] = True
-        return result
-    except Exception as e:
-        logger.exception(f"Error in claim_callback: {e}")
-        try:
-            await q.message.reply_text("⚠️ Сталася помилка при взятті запиту.")
-        except Exception:
-            pass
-        return ConversationHandler.END
-
-
-# 📤 Обробка введення розсилки
-async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отримуємо текст або медіа для розсилки."""
-    # Якщо адмін вже у режимі відповіді — ігноруємо без повідомлень
-    if context.user_data.get("reply_mode_active") or context.user_data.get("replying_claim_id"):
-        logger.debug("🚫 Broadcast input ігноровано — адмін у режимі відповіді.")
-        return ConversationHandler.END
-        
-    if context.user_data.get("replying_claim_id") or context.user_data.get("reply_mode_active"):
-        logger.debug("🚫 Broadcast input пропущено — адмін зараз у reply mode.")
-        return ConversationHandler.END
-
-    if not context.user_data.get("broadcast_active"):
-        return ConversationHandler.END
-
-    tg_id = str(update.effective_user.id)
-    if not await ensure_is_admin(tg_id):
-        await update.message.reply_text("⛔ Ви не є адміністратором.")
-        return ConversationHandler.END
-
-    session = SessionLocal()
-    try:
-        text = update.message.caption or update.message.text or None
-        file_id = None
-        file_type = None
-        if update.message.photo:
-            file_id = update.message.photo[-1].file_id
-            file_type = "photo"
-        elif update.message.document:
-            file_id = update.message.document.file_id
-            file_type = "document"
-        elif update.message.video:
-            file_id = update.message.video.file_id
-            file_type = "video"
-        elif update.message.voice:
-            file_id = update.message.voice.file_id
-            file_type = "voice"
-        elif update.message.audio:
-            file_id = update.message.audio.file_id
-            file_type = "audio"
-
-        bc = {"text": text, "file_id": file_id, "file_type": file_type, "media_path": None}
-        context.user_data["broadcast"] = bc
-
-        if file_id:
-            try:
-                bot = context.bot
-                file = await bot.get_file(file_id)
-                ext = {
-                    "photo": "jpg",
-                    "document": "dat",
-                    "video": "mp4",
-                    "voice": "ogg",
-                    "audio": "mp3"
-                }.get(file_type, "bin")
-                filename = f"broadcast_{file_type}_{int(datetime.utcnow().timestamp())}_{tg_id}.{ext}"
-                media_path = f"/data/media/{filename}"
-                os.makedirs("/data/media", exist_ok=True)
-                await file.download_to_drive(media_path)
-                bc["media_path"] = media_path
-                logger.info(f"📁 Broadcast media saved: {media_path}")
-            except Exception as e:
-                logger.warning(f"⚠️ Не вдалося зберегти файл для розсилки: {e}")
-                bc["media_path"] = None
-
-        confirm_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Підтвердити і надіслати", callback_data="broadcast_confirm")],
-            [InlineKeyboardButton("❌ Скасувати", callback_data="broadcast_cancel")]
-        ])
-        summary = bc["text"] or "(без тексту)"
-        if bc["file_type"]:
-            summary += f"\n\n(з медіа: {bc['file_type']})"
-        await update.message.reply_text(f"📣 Підтвердіть розсилку:\n\n{summary}", reply_markup=confirm_kb)
-        return ASK_BROADCAST_CONFIRM
-
-    finally:
-        session.close()
 
 async def broadcast_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -335,16 +497,61 @@ async def silent_broadcast_cancel(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("broadcast_active", None)
     logger.info("🧹 Silent broadcast cancel executed.")
 
+import asyncio
+from telegram.ext import ConversationHandler
+
 async def broadcast_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+    """Скасування розсилки (на будь-якому етапі: введення або підтвердження)."""
     tg_id = str(update.effective_user.id)
-    if not await ensure_is_admin(tg_id):
-        await q.message.reply_text("⛔ Ви не є адміністратором.")
-        return
-    await silent_broadcast_cancel(context)
-    await q.message.reply_text("❌ Розсилка скасована.")
+    is_admin = await ensure_is_admin(tg_id)
+
+    # Визначаємо повідомлення для відповіді
+    if update.callback_query:
+        q = update.callback_query
+        await q.answer()
+        target = q.message
+    else:
+        target = update.message
+
+    # Якщо не адмін
+    if not is_admin:
+        await target.reply_text("⛔ Ви не є адміністратором.")
+        return ConversationHandler.END
+
+    # 🧹 Видалення медіа (якщо було)
+    bc = context.user_data.get("broadcast")
+    if bc and bc.get("media_path"):
+        try:
+            os.remove(bc["media_path"])
+        except Exception:
+            pass
+
+    # 🧠 Повне очищення контексту користувача
+    context.user_data.clear()
+
+    # 💣 Насильно прибираємо залишки поточної розмови (це головне)
+    app = context.application
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    for group in app.handlers.values():
+        for handler in group:
+            if isinstance(handler, ConversationHandler) and getattr(handler, "name", "") == "broadcast_conv":
+                if hasattr(handler, "conversations"):
+                    handler.conversations.pop((chat_id, user_id), None)
+                    logger.info(f"💣 [BROADCAST_CANCEL] Залишки сесії broadcast_conv видалено для user={user_id}")
+
+    # 💤 Маленька затримка для стабільного виходу зі стану
+    await asyncio.sleep(0.2)
+
+    await target.reply_text("❌ Розсилку скасовано.")
+    logger.info(f"🧹 [BROADCAST_CANCEL] Розсилку скасовано вручну для admin={tg_id}")
+
     return ConversationHandler.END
+
+
+
+
 
 
 # --- Меню ---
@@ -439,13 +646,7 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]
         await query.message.reply_text("🏢 Меню компаній:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # --- Массова розсилка ---
-    elif data == "broadcast":
-        # Тепер нічого не ставимо тут — ConversationHandler має entry handler start_broadcast_callback
-        # Просто викличемо answer, щоб UX був чіткий (якщо цей гілка все ж спрацьовує)
-        await query.message.reply_text("Починаю режим розсилки... (відкривається вікно для введення).")
-        # НЕ повертати тут стан — щоб ConversationHandler entry спрацював
-        return
+
 
 
     # --- Необроблені повідомлення ---
@@ -1009,120 +1210,6 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         session.close()
 
 
-async def start_claim_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    if not data or not data.startswith("claim:"):
-        return ConversationHandler.END
-
-    try:
-        msgid = int(data.split(":", 1)[1])
-    except Exception:
-        await q.message.reply_text("Неправильний формат запиту.")
-        return ConversationHandler.END
-
-    admin_tg = str(update.effective_user.id)
-    session = SessionLocal()
-
-    try:
-        message = session.query(Message).filter_by(id=msgid).first()
-        if not message:
-            await q.message.reply_text("Повідомлення вже не знайдено.")
-            return ConversationHandler.END
-
-        existing = session.query(Claim).filter_by(message_id=msgid).first()
-        if existing:
-            admin_obj = session.query(Admin).filter_by(id=existing.admin_id).first()
-            admin_name = admin_obj.name if admin_obj else str(existing.admin_id)
-            await q.message.reply_text(f"⚠️ Запит вже взяв адміністратор {admin_name}")
-            return ConversationHandler.END
-
-        admin_obj = session.query(Admin).filter_by(tg_id=admin_tg).first()
-        if not admin_obj:
-            await q.message.reply_text("❌ Ви не зареєстровані як адміністратор.")
-            return ConversationHandler.END
-
-        client_obj = session.query(Client).filter_by(tg_id=message.client_tg_id).first()
-
-        claim = Claim(
-            message_id=msgid,
-            client_id=client_obj.id if client_obj else None,
-            admin_id=admin_obj.id,
-            title=f"Запит від {client_obj.name if client_obj else message.client_tg_id}",
-            description=(message.text or "")[:4000],
-            status="in_progress"
-        )
-        session.add(claim)
-        session.commit()
-        session.refresh(claim)
-
-        other_admins = session.query(Admin).filter(Admin.tg_id != admin_tg).all()
-        notify_text = f"🔒 Запит #{msgid} взяв адміністратор {admin_obj.name or admin_obj.tg_id}"
-        for a in other_admins:
-            try:
-                await context.bot.send_message(chat_id=int(a.tg_id), text=notify_text)
-            except Exception:
-                pass
-
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Взято ✅", callback_data="taken")]])
-        try:
-            await q.edit_message_reply_markup(reply_markup=keyboard)
-        except Exception:
-            pass
-
-        context.user_data["replying_claim_id"] = claim.id
-
-        await context.bot.send_message(
-            chat_id=int(admin_tg),
-            text=(
-                f"🟢 Ви взяли запит #{msgid} від клієнта "
-                f"{client_obj.name if client_obj else message.client_tg_id}.\n\n"
-                f"✍️ Тепер просто напишіть повідомлення у цьому чаті — "
-                f"воно буде надіслано клієнту від вашого імені ({admin_obj.name or admin_tg})."
-            )
-        )
-
-        logger.info(f"✅ Admin {admin_tg} взяв claim #{claim.id}")
-        return ConversationHandler.END  # 💥 ключова частина
-
-    finally:
-        session.close()
-
-# callback handler for "Відповісти" (claim)
-
-async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробник кнопки 'Відповісти' — скидає режим розсилки (якщо був) і запускає flow взяття claim."""
-    q = update.callback_query
-    await q.answer()
-    admin_tg = str(update.effective_user.id)
-
-    # 1) Якщо був режим broadcast — попросимо його відмінити через broadcast_cancel_callback
-    #    Але не намагаємось лізти в внутрішні структури PTB.
-    if context.user_data.get("broadcast_active") or context.user_data.get("broadcast"):
-        logger.info("ℹ️ Користувач у режимі broadcast — відміняю розсилку перед взяттям claim.")
-        try:
-            # Викликаємо функцію-колбек для скасування так, ніби натиснули ❌
-            await broadcast_cancel_callback(update, context)
-        except Exception as e:
-            logger.warning(f"Не вдалося викликати broadcast_cancel_callback: {e}")
-        # Гарантуємо, що прапорці видалені
-        context.user_data.pop("broadcast_active", None)
-        context.user_data.pop("broadcast", None)
-
-    # 2) Тепер безпечне виконання логіки взяття claim
-    #    (рознесена в окрему функцію start_claim_flow)
-    try:
-        return await start_claim_flow(update, context)
-    except Exception as e:
-        logger.exception(f"Error in claim_callback wrapper: {e}")
-        try:
-            await q.message.reply_text("⚠️ Сталася помилка при взятті запиту.")
-        except Exception:
-            pass
-        return
-
-
     
     
 async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1380,6 +1467,10 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return  # ігноруємо повідомлення для admin chat під час вводу тексту розсилки
 
     # 4) За замовчуванням — обробка відповіді клієнтові
+    context.user_data["reply_mode_active"] = False
+    context.user_data.pop("replying_claim_id", None)
+    logger.info("✅ [REPLY_MODE] Вимкнено після відправлення повідомлення клієнту.")
+
     return await handle_admin_reply(update, context)
 
 
@@ -1387,7 +1478,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def set_admin_commands(app):
     await app.bot.set_my_commands([
-        BotCommand("start", "🔹 Запустити адмін-бота"),
+        BotCommand("start1", "🔹 Запустити адмін-бота"),
         BotCommand("help_admin", "ℹ️ Допомога по командам"),
     ])
     logger.info("✅ Команди /start і /help_admin додані в меню Telegram")
@@ -1396,9 +1487,10 @@ def run_admin_bot():
     app = ApplicationBuilder().token(ADMIN_TOKEN).post_init(set_admin_commands).build()
 
     # --- 🧭 Основні команди ---
-    app.add_handler(CommandHandler("start", start_admin))
+    app.add_handler(CommandHandler("start1", start_admin))
     app.add_handler(CommandHandler("help_admin", help_admin))
     app.add_handler(CommandHandler("start_admin", start_admin))
+    app.add_handler(CommandHandler("cancel", broadcast_cancel_callback))
 
     # --- 🏢 CRUD-команди ---
     app.add_handler(CommandHandler("add_company", add_company_cmd))
@@ -1436,14 +1528,15 @@ def run_admin_bot():
                     (filters.TEXT | filters.PHOTO | filters.VOICE | filters.VIDEO | filters.AUDIO | filters.Document.ALL)
                     & ~filters.COMMAND,
                     handle_broadcast_input
-                )
+                ),
+                CommandHandler("cancel", broadcast_cancel_callback),
             ],
             ASK_BROADCAST_CONFIRM: [
                 CallbackQueryHandler(broadcast_confirm_callback, pattern="^broadcast_confirm$"),
                 CallbackQueryHandler(broadcast_cancel_callback, pattern="^broadcast_cancel$"),
             ],
         },
-        fallbacks=[CallbackQueryHandler(broadcast_cancel_callback, pattern="^broadcast_cancel$")],
+        fallbacks=[],
         per_chat=True,
         per_user=True,
     )
