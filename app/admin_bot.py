@@ -39,6 +39,33 @@ ASK_BROADCAST_TEXT = 200
 ASK_BROADCAST_CONFIRM = 201
 
 
+# entry для broadcast — окрема проста функція, щоб ConversationHandler точно активувався
+async def start_broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Почати масову розсилку — entry point для ConversationHandler."""
+    q = update.callback_query
+    await q.answer()
+
+    tg_id = str(update.effective_user.id)
+    if not await ensure_is_admin(tg_id):
+        await q.message.reply_text("⛔ Ви не є адміністратором.")
+        return ConversationHandler.END
+
+    # повідомлення з інструкцією
+    await q.message.reply_text(
+        "📣 Введіть текст повідомлення **або** надішліть медіа з підписом, яке потрібно розіслати всім клієнтам.\n\n"
+        "Після надсилання натисніть ПІДТВЕРДИТИ або натисніть ❌ Скасувати (/cancel).",
+        parse_mode="Markdown"
+    )
+
+    # Не ставимо context.user_data['action']="broadcast" — нехай ConversationHandler керує потоком
+    # Очищаємо старі дані
+    context.user_data.pop("broadcast", None)
+    # Маркуємо, що зараз перебуваємо в режимі broadcast (не обов'язково, але зручно для логів)
+    context.user_data["broadcast_active"] = True
+
+    return ASK_BROADCAST_TEXT
+
+
 #повторні спроби та обробка помилок
 async def safe_send(client_bot: Bot, send_coro_callable, *args, retry=1, delay_on_timeout=5, **kwargs):
     """
@@ -231,6 +258,10 @@ async def broadcast_confirm_callback(update: Update, context: ContextTypes.DEFAU
 
         context.user_data.pop("broadcast", None)
         session.close()
+        context.user_data.pop("broadcast", None)
+        context.user_data["broadcast_active"] = False
+    return ConversationHandler.END
+
 #callback handlers для підтвердження / відміни. Додавши обробку broadcast_confirm та broadcast_cancel в admin_menu_callback або як глобальні CallbackQueryHandler — краще окремим handler-ом:
 
 async def broadcast_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,7 +279,9 @@ async def broadcast_cancel_callback(update: Update, context: ContextTypes.DEFAUL
                 os.remove(bc["media_path"])
         except Exception:
             pass
+    context.user_data["broadcast_active"] = False
     await q.message.reply_text("❌ Розсилка скасована.")
+    return ConversationHandler.END
 
 
 # --- Меню ---
@@ -341,15 +374,11 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # --- Массова розсилка ---
     elif data == "broadcast":
-        await query.message.reply_text(
-            "📣 Введіть текст повідомлення **або** надішліть медіа з підписом, яке потрібно розіслати всім клієнтам.\n\n"
-            "Після надсилання натисніть ПІДТВЕРДИТИ або /cancel для скасування.",
-            parse_mode="Markdown"
-        )
-        context.user_data["action"] = "broadcast"
-        # очищаємо попередні дані
-        context.user_data.pop("broadcast", None)
-        return ASK_BROADCAST_TEXT
+        # Тепер нічого не ставимо тут — ConversationHandler має entry handler start_broadcast_callback
+        # Просто викличемо answer, щоб UX був чіткий (якщо цей гілка все ж спрацьовує)
+        await query.message.reply_text("Починаю режим розсилки... (відкривається вікно для введення).")
+        # НЕ повертати тут стан — щоб ConversationHandler entry спрацював
+        return
 
 
     # --- Необроблені повідомлення ---
@@ -1233,16 +1262,14 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
     """Головний обробник будь-яких повідомлень від адміна."""
     action = context.user_data.get("action")
 
-    # Якщо очікується CRUD-дія (add/update/delete компанію чи клієнта)
     if action in [
         "add_company_menu", "update_company_menu", "delete_company_menu",
         "add_client_menu", "update_client_menu", "delete_client_menu"
     ]:
-        # 🔁 передаємо повідомлення в handle_crud_input
         return await handle_crud_input(update, context)
 
-    # Інакше — це звичайна відповідь клієнту (система підтримки)
     return await handle_admin_reply(update, context)
+
 
 
 
@@ -1271,35 +1298,47 @@ def run_admin_bot():
     # --- 💬 Callback для кнопки "Відповісти" ---
     app.add_handler(CallbackQueryHandler(claim_callback, pattern=r"^claim:\d+$"))
 
-    # --- 👥 Адмінські команди ---
-    app.add_handler(CommandHandler("list_admins", list_admins))
-    # у run_admin_bot(), перед MEDIA MessageHandler:
-    # --- 📣 Блок розсилки ---
-    broadcast_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_menu_callback, pattern="^broadcast$")],
+    # --- 👥 CRUD адміністраторів (окремий ConversationHandler) ---
+    admin_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_menu_callback, pattern="^(add_admin|update_admin|delete_admin)$"),
+        ],
         states={
-            ASK_BROADCAST_TEXT: [MessageHandler(
-                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.VIDEO | filters.AUDIO | filters.Document.ALL)
-                & ~filters.COMMAND, handle_broadcast_input
-            )],
+            ASK_CONTACT: [MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND), receive_contact)],
+            ASK_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_admin_input)],
+            ASK_ADMIN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_admin_name)],
+        },
+        fallbacks=[],
+        per_chat=True,
+        per_user=True
+    )
+    app.add_handler(admin_conv)
+
+    # --- 📣 Масова розсилка ---
+    broadcast_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_broadcast_callback, pattern="^broadcast$")],
+        states={
+            ASK_BROADCAST_TEXT: [
+                MessageHandler(
+                    (filters.TEXT | filters.PHOTO | filters.VOICE | filters.VIDEO | filters.AUDIO | filters.Document.ALL)
+                    & ~filters.COMMAND,
+                    handle_broadcast_input
+                )
+            ],
             ASK_BROADCAST_CONFIRM: [
                 CallbackQueryHandler(broadcast_confirm_callback, pattern="^broadcast_confirm$"),
-                CallbackQueryHandler(broadcast_cancel_callback, pattern="^broadcast_cancel$")
+                CallbackQueryHandler(broadcast_cancel_callback, pattern="^broadcast_cancel$"),
             ],
         },
         fallbacks=[CallbackQueryHandler(broadcast_cancel_callback, pattern="^broadcast_cancel$")],
+        per_chat=True,
         per_user=True,
-        per_chat=True
     )
     app.add_handler(broadcast_conv)
 
-    # --- 📎 Обробка медіа та тексту ---
+    # --- 📎 Обробка медіа/тексту поза станами ---
     MEDIA_FILTERS = (
-        filters.PHOTO |
-        filters.VIDEO |
-        filters.Document.ALL |
-        filters.VOICE |
-        filters.AUDIO
+        filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO
     )
 
     app.add_handler(MessageHandler(
@@ -1307,27 +1346,12 @@ def run_admin_bot():
         handle_admin_message
     ))
 
-    # --- ⚙️ ConversationHandler тільки для add/update/delete admin ---
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("add_admin", add_admin_cmd),
-            CommandHandler("update_admin", update_admin_cmd),
-            CommandHandler("delete_admin", delete_admin_cmd),
-        ],
-        states={
-            ASK_CONTACT: [MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND), receive_contact)],
-            ASK_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_admin_input)],
-            ASK_ADMIN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_admin_name)],
-        },
-        fallbacks=[]
-    )
-    app.add_handler(conv_handler)
-
-    # --- 🧩 Один-єдиний CallbackQueryHandler для всього меню ---
+    # --- 🧩 Callback для решти меню ---
     app.add_handler(CallbackQueryHandler(admin_menu_callback, pattern=".*"))
 
     logger.info("✅ Запускаю admin bot")
     app.run_polling()
+
 
 
 
