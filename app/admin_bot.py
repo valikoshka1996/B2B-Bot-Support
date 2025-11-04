@@ -39,7 +39,7 @@ SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", "support@yourcompany.com")
 init_db(initial_admin_tg_id=INITIAL_ADMIN)
 
 # States for adding admin via contact
-ASK_CONTACT = 1
+ASK_CONTACT = range(1)
 
 ASK_ADMIN_ID, ASK_ADMIN_NAME, ASK_ADMIN_SUPER = range(3)
 ASK_BROADCAST_TEXT = 200
@@ -1043,7 +1043,7 @@ async def receive_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Не вдалося надіслати повідомлення новому адміну {tg}: {e}")
 
-        await update.message.reply_text(f"✅ Адмін доданий: {tg}")
+        await update.message.reply_text(f"✅ Адмін доданий: {name or tg}")
 
     finally:
         session.close()
@@ -1601,8 +1601,6 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
     return await handle_admin_reply(update, context)
 
 
-
-
 async def set_admin_commands(app):
     await app.bot.set_my_commands([
         BotCommand("start1", "🔹 Запустити адмін-бота"),
@@ -1618,6 +1616,7 @@ def run_admin_bot():
     app.add_handler(CommandHandler("help_admin", help_admin))
     app.add_handler(CommandHandler("start_admin", start_admin))
 #   app.add_handler(CommandHandler("cancel", broadcast_cancel_callback))
+    #app.add_handler(CallbackQueryHandler(unknown_callback))
 
     # --- 🏢 CRUD-команди ---
     app.add_handler(CommandHandler("add_company", add_company_cmd))
@@ -1641,8 +1640,10 @@ def run_admin_bot():
         },
         fallbacks=[],
         per_chat=True,
-        per_user=True
+        per_user=True,
+        per_message=True,
     )
+
     app.add_handler(admin_conv)
 
     # --- 📣 Масова розсилка ---
@@ -1685,9 +1686,9 @@ def run_admin_bot():
         per_chat=True,
         per_user=True,
     )
-    app.add_handler(add_client_conv)
-
     app.add_handler(broadcast_conv)
+
+    app.add_handler(add_client_conv)
 
     # --- 📎 Обробка медіа/тексту поза станами ---
     MEDIA_FILTERS = (
