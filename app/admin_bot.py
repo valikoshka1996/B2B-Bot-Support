@@ -1,27 +1,33 @@
 import os
-from dotenv import load_dotenv
-from datetime import datetime
-from telegram import BotCommand
-from sqlalchemy import exists
 import asyncio
-load_dotenv()
+import inspect
+import logging
+from datetime import datetime
+
+from dotenv import load_dotenv
+from sqlalchemy import exists
 from telegram.error import TimedOut, RetryAfter, NetworkError
 from telegram.helpers import escape_markdown
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
-from telegram.ext import CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ConversationHandler
-from .db import SessionLocal
-from .models import Admin, Company, Client, Message, Claim
-from .utils import init_db, add_admin, add_company, add_client
-from .utils import update_admin, delete_admin, update_company, delete_company, update_client, delete_client, get_company_history
-import inspect
-
-import logging
-
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand, Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+)
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, filters,
     CallbackQueryHandler, ContextTypes, ConversationHandler
 )
+
+from .db import SessionLocal
+from .models import Admin, Company, Client, Message, Claim
+from .utils import (
+    init_db, add_admin, add_company, add_client,
+    update_admin, delete_admin,
+    update_company, delete_company,
+    update_client, delete_client,
+    get_company_history
+)
+
+# Load environment variables
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,6 +45,9 @@ ASK_ADMIN_ID, ASK_ADMIN_NAME, ASK_ADMIN_SUPER = range(3)
 ASK_BROADCAST_TEXT = 200
 ASK_BROADCAST_CONFIRM = 201
 
+ASK_CLIENT_CONTACT, ASK_CLIENT_NAME, ASK_CLIENT_COMPANY = range(300, 303)
+
+
 def log_tracepoint(tag: str, context: ContextTypes.DEFAULT_TYPE = None):
     """Показує чіткий трек у консолі — хто викликав, де і з якими прапорцями."""
     frame = inspect.stack()[1]
@@ -51,7 +60,6 @@ def log_tracepoint(tag: str, context: ContextTypes.DEFAULT_TYPE = None):
     )
 
 
-# ------------------- HANDLE BROADCAST INPUT -------------------
 
 
 # ------------------- HANDLE BROADCAST INPUT -------------------
@@ -359,6 +367,118 @@ async def start_broadcast_callback(update: Update, context: ContextTypes.DEFAULT
     logger.info("✅ [BROADCAST] Broadcast режим активовано (нова сесія).")
 
     return ASK_BROADCAST_TEXT
+
+
+
+#хендлер обробки контакту клієнта:
+async def handle_client_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробка отриманого контакту або вручну введеного ID/username."""
+    msg = update.message
+    session = SessionLocal()
+
+    tg_id = None
+    name = None
+
+    # --- Якщо контакт ---
+    if msg.contact:
+        contact = msg.contact
+        tg_id = str(contact.user_id) if contact.user_id else contact.phone_number
+        name_parts = [contact.first_name or "", contact.last_name or ""]
+        name = " ".join(p for p in name_parts if p).strip()
+
+    # --- Якщо текст (ID або @username) ---
+    elif msg.text:
+        text = msg.text.strip()
+        if text.startswith("@"):
+            tg_id = text[1:]  # зберігаємо як username без @
+        else:
+            tg_id = text
+        name = None  # запитаємо далі
+
+    # --- Перевірка ---
+    if not tg_id:
+        await msg.reply_text("❌ Не вдалося отримати Telegram ID. Спробуйте ще раз.")
+        return ASK_CLIENT_CONTACT
+
+    # Зберігаємо в контексті
+    context.user_data["new_client_tg_id"] = tg_id
+    context.user_data["new_client_name"] = name
+
+    if not name:
+        await msg.reply_text("✏️ Введіть ім’я клієнта:")
+        session.close()
+        return ASK_CLIENT_NAME
+
+    # Якщо вже є ім’я — одразу переходимо до вибору компанії
+    companies = session.query(Company).all()
+    if not companies:
+        await msg.reply_text("⚠️ Немає жодної компанії. Спочатку додайте компанію.")
+        session.close()
+        return ConversationHandler.END
+
+    text = "🏢 Доступні компанії:\n" + "\n".join([f"{c.id} — {c.name}" for c in companies])
+    await msg.reply_text(text + "\n\nВведіть ID компанії:")
+    session.close()
+    return ASK_CLIENT_COMPANY
+
+#хендлер обробки введення імені клієнта:
+
+async def handle_client_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробка введеного імені клієнта."""
+    name = update.message.text.strip()
+    context.user_data["new_client_name"] = name
+
+    session = SessionLocal()
+    companies = session.query(Company).all()
+    if not companies:
+        await update.message.reply_text("⚠️ Немає жодної компанії. Спочатку додайте компанію.")
+        session.close()
+        return ConversationHandler.END
+
+    text = "🏢 Доступні компанії:\n" + "\n".join([f"{c.id} — {c.name}" for c in companies])
+    await update.message.reply_text(text + "\n\nВведіть ID компанії:")
+    session.close()
+    return ASK_CLIENT_COMPANY
+
+
+#хендлер обробки введення компанії для клієнта:
+
+async def handle_client_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Фінальний крок — збереження клієнта."""
+    session = SessionLocal()
+    company_id_text = update.message.text.strip()
+
+    if not company_id_text.isdigit():
+        await update.message.reply_text("❌ ID компанії має бути числом. Спробуйте ще раз:")
+        session.close()
+        return ASK_CLIENT_COMPANY
+
+    company_id = int(company_id_text)
+    company = session.query(Company).filter_by(id=company_id).first()
+    if not company:
+        await update.message.reply_text("❌ Компанію не знайдено. Введіть інший ID:")
+        session.close()
+        return ASK_CLIENT_COMPANY
+
+    company_name = company.name  # ✅ читаємо до закриття сесії
+
+    tg_id = context.user_data.get("new_client_tg_id")
+    name = context.user_data.get("new_client_name") or "—"
+
+    # зберігаємо в базу
+    add_client(session, tg_id=tg_id, name=name, company_id=company_id)
+    session.close()
+
+    await update.message.reply_text(
+        f"✅ Клієнта *{name}* успішно додано до компанії *{company_name}*.",
+        parse_mode="Markdown"
+    )
+
+    logger.info(f"✅ [ADD_CLIENT] Клієнта '{name}' додано до компанії '{company_name}' (tg_id={tg_id})")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
 
 
 
@@ -809,8 +929,15 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     # --- CRUD клієнтів ---
     elif data == "add_client_menu":
-        await query.message.reply_text("Введіть дані клієнта у форматі:\n`tg_id|Ім’я|company_id`", parse_mode="Markdown")
+        # Скидаємо всі попередні дії
+        context.user_data.clear()
         context.user_data["action"] = "add_client_menu"
+
+        await query.message.reply_text(
+            "📞 Надішліть контакт клієнта (через 📎), "
+            "або введіть його Telegram ID чи юзернейм (@username):"
+        )
+        return ASK_CLIENT_CONTACT
 
     elif data == "update_client_menu":
         await query.message.reply_text("Введіть нові дані клієнта у форматі:\n`tg_id|Ім’я|company_id`", parse_mode="Markdown")
@@ -1490,7 +1617,7 @@ def run_admin_bot():
     app.add_handler(CommandHandler("start1", start_admin))
     app.add_handler(CommandHandler("help_admin", help_admin))
     app.add_handler(CommandHandler("start_admin", start_admin))
-    app.add_handler(CommandHandler("cancel", broadcast_cancel_callback))
+#   app.add_handler(CommandHandler("cancel", broadcast_cancel_callback))
 
     # --- 🏢 CRUD-команди ---
     app.add_handler(CommandHandler("add_company", add_company_cmd))
@@ -1540,6 +1667,26 @@ def run_admin_bot():
         per_chat=True,
         per_user=True,
     )
+    # --- ➕ Додавання клієнта ---
+    add_client_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_menu_callback, pattern="^add_client_menu$")],
+        states={
+            ASK_CLIENT_CONTACT: [
+                MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND), handle_client_contact)
+            ],
+            ASK_CLIENT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_client_name)
+            ],
+            ASK_CLIENT_COMPANY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_client_company)
+            ],
+        },
+        fallbacks=[],
+        per_chat=True,
+        per_user=True,
+    )
+    app.add_handler(add_client_conv)
+
     app.add_handler(broadcast_conv)
 
     # --- 📎 Обробка медіа/тексту поза станами ---
