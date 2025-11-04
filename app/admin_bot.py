@@ -4,6 +4,7 @@ import inspect
 import logging
 from datetime import datetime
 
+
 from dotenv import load_dotenv
 from sqlalchemy import exists
 from telegram.error import TimedOut, RetryAfter, NetworkError
@@ -705,6 +706,7 @@ def safe_md2(value):
 
 # --- Виклик з меню ---
 async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.debug(f"ADMIN_MENU_CALLBACK invoked. data={getattr(update.callback_query, 'data', None)}; from={update.effective_user.id}")
     if context.user_data.get("broadcast_active"):
         context.user_data.pop("broadcast_active", None)
         context.user_data.pop("broadcast", None)
@@ -1641,7 +1643,7 @@ def run_admin_bot():
         fallbacks=[],
         per_chat=True,
         per_user=True,
-        per_message=True,
+        per_message=False,
     )
 
     app.add_handler(admin_conv)
@@ -1649,7 +1651,9 @@ def run_admin_bot():
     # --- 📣 Масова розсилка ---
     broadcast_conv = ConversationHandler(
         name="broadcast_conv",
-        entry_points=[CallbackQueryHandler(start_broadcast_callback, pattern="^broadcast$")],
+        entry_points=[
+            CallbackQueryHandler(start_broadcast_callback, pattern="^broadcast$")
+        ],
         states={
             ASK_BROADCAST_TEXT: [
                 MessageHandler(
@@ -1667,6 +1671,7 @@ def run_admin_bot():
         fallbacks=[],
         per_chat=True,
         per_user=True,
+        per_message=False,
     )
     # --- ➕ Додавання клієнта ---
     add_client_conv = ConversationHandler(
@@ -1701,7 +1706,7 @@ def run_admin_bot():
     ))
 
     # --- 🧩 Callback для решти меню ---
-    app.add_handler(CallbackQueryHandler(admin_menu_callback, pattern=".*"))
+    app.add_handler(CallbackQueryHandler(admin_menu_callback, pattern=r'^(?!add_admin$|update_admin$|delete_admin$|broadcast$|add_client_menu$|claim:).+'))
 
     logger.info("✅ Запускаю admin bot")
     app.run_polling()
