@@ -3,7 +3,9 @@ import asyncio
 import inspect
 import logging
 from datetime import datetime
-
+import html
+import math
+from .pagination.view_history import view_history_paginated
 
 from dotenv import load_dotenv
 from sqlalchemy import exists
@@ -606,6 +608,116 @@ async def broadcast_confirm_callback(update: Update, context: ContextTypes.DEFAU
 
 #callback handlers для підтвердження / відміни. Додавши обробку broadcast_confirm та broadcast_cancel в admin_menu_callback або як глобальні CallbackQueryHandler — краще окремим handler-ом:
 
+#Reset бота
+async def reset_states_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id if query.message else query.from_user.id
+    user_id = query.from_user.id
+
+    await context.bot.send_message(chat_id, "🔄 Скидаю всі стани...")
+
+    logger.warning(f"🔄 Admin {query.from_user.username} ({user_id}) виконав повний reset станів.")
+
+    try:
+        # 1) Очистка локальних context-даних
+        try:
+            context.user_data.clear()
+        except Exception:
+            logger.debug("Не вдалося context.user_data.clear()", exc_info=True)
+        try:
+            context.chat_data.clear()
+        except Exception:
+            logger.debug("Не вдалося context.chat_data.clear()", exc_info=True)
+
+        # 2) Спроба очистити внутрішні структури ConversationHandler у різних формах
+        cleared_handlers = 0
+        for handlers_group in context.application.handlers.values():
+            for handler in handlers_group:
+                # перевіряємо тип, щоб уникнути зайвих об'єктів
+                try:
+                    from telegram.ext import ConversationHandler as PTBConversationHandler
+                except Exception:
+                    PTBConversationHandler = None
+
+                if PTBConversationHandler and isinstance(handler, PTBConversationHandler):
+                    cleaned = False
+                    # можливі імена внутрішніх атрибутів у різних версіях PTB
+                    possible_attrs = ("conversations", "_conversations", "conversation_storage", "conversation_states")
+                    for attr in possible_attrs:
+                        conv_obj = getattr(handler, attr, None)
+                        if conv_obj is not None:
+                            try:
+                                # conv_obj може бути dict або спеціальним об'єктом з clear()
+                                if hasattr(conv_obj, "clear"):
+                                    conv_obj.clear()
+                                else:
+                                    # якщо ітерабельний mapping — видаляємо ключі
+                                    for k in list(conv_obj.keys()):
+                                        conv_obj.pop(k, None)
+                                cleaned = True
+                                break
+                            except Exception:
+                                logger.debug(f"Не вдалося очистити {attr} у handler {handler}", exc_info=True)
+                    if cleaned:
+                        cleared_handlers += 1
+
+        # 3) Очистити глобальний application._conversations (якщо є)
+        try:
+            if hasattr(context.application, "_conversations"):
+                # _conversations зазвичай mapping {(chat_id, user_id): state}
+                convs = context.application._conversations
+                # видаляємо ключі що стосуються поточного чату/юзера
+                keys_to_remove = []
+                for k in list(convs.keys()):
+                    try:
+                        # ключ може бути tuple (chat_id, user_id) або інший формат
+                        if (isinstance(k, tuple) and (k[0] == chat_id or k[1] == user_id)) or (k == chat_id) or (k == user_id):
+                            keys_to_remove.append(k)
+                    except Exception:
+                        # якщо несподіваний формат — видалимо всі, щоб бути впевненим (fallback)
+                        keys_to_remove.append(k)
+                for k in keys_to_remove:
+                    try:
+                        convs.pop(k, None)
+                    except Exception:
+                        pass
+        except Exception:
+            logger.debug("Не вдалося почистити context.application._conversations", exc_info=True)
+
+        # 4) Якщо є persistence — спробувати почистити його записи для цього користувача/чату
+        try:
+            persistence = getattr(context.application, "persistence", None)
+            if persistence:
+                try:
+                    if hasattr(persistence, "drop_user_data"):
+                        persistence.drop_user_data(user_id)
+                    if hasattr(persistence, "drop_chat_data"):
+                        persistence.drop_chat_data(chat_id)
+                    # якщо є flush/close методи
+                    if hasattr(persistence, "flush"):
+                        persistence.flush()
+                except Exception as e:
+                    logger.warning(f"Не вдалося очистити persistence: {e}")
+        except Exception:
+            logger.debug("Помилка при роботі з persistence", exc_info=True)
+
+        await context.bot.send_message(chat_id, f"✅ Всі стани очищено. Очищено handlers: {cleared_handlers}")
+
+        # 5) Повернутися в головне меню (start_admin обробляє як message.reply_text або callback)
+        # Викликаємо start_admin з оригінальним update (в якому є query.message) — воно відпрацює нормально
+        fake_update = Update(update.update_id, message=query.message)
+        await start_admin(fake_update, context)
+
+    except Exception as e:
+        logger.exception("Помилка під час скидання станів")
+        try:
+            await context.bot.send_message(chat_id, f"❌ Помилка при скиданні станів: {e}")
+        except Exception:
+            pass
+
+        
 async def silent_broadcast_cancel(context: ContextTypes.DEFAULT_TYPE):
     """Прибирає усі дані розсилки без відправлення повідомлення."""
     bc = context.user_data.pop("broadcast", None)
@@ -692,6 +804,7 @@ async def start_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👥 Клієнти", callback_data="clients_menu")],
         [InlineKeyboardButton("🕓 Історія комунікацій", callback_data="history_menu")],
         [InlineKeyboardButton("📣 МАССОВА РОЗСИЛКА", callback_data="broadcast")],
+        [InlineKeyboardButton("🔄 Перезавантажити бота", callback_data="reset_states")],  # ← Додано
 
 
     ]
@@ -840,38 +953,9 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             session.close()
 
     elif data.startswith("view_history:"):
-        company_id = int(data.split(":")[1])
-        session = SessionLocal()
-        try:
-            company = session.query(Company).filter_by(id=company_id).first()
-            if not company:
-                await query.message.reply_text("❌ Компанію не знайдено.")
-                return
+        await view_history_paginated(update, context)
 
-            from app.utils import get_company_history
-            messages = get_company_history(session, company_id)
-            if not messages:
-                await query.message.reply_text(f"📭 У компанії <b>{company.name}</b> немає історії повідомлень.", parse_mode="HTML")
-                return
 
-            text = f"<b>🕓 Історія повідомлень компанії {company.name}</b>\n\n"
-            for msg in messages[-50:]:
-                sender = "👤 Клієнт" if msg.direction == "in" else "🛠️ Адмін"
-                recipient = "🛠️ Адміну" if msg.direction == "in" else "👤 Клієнту"
-                text += (
-                    f"<b>{sender} → {recipient}</b>\n"
-                    f"<i>{msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}</i>\n"
-                    f"{msg.text or '(без тексту)'}\n"
-                    f"────────────────────\n"
-                )
-
-            await query.message.reply_text(text[:4000], parse_mode="HTML")
-
-        except Exception as e:
-            logger.error(f"Помилка при перегляді історії компанії {company_id}: {e}")
-            await query.message.reply_text("⚠️ Помилка при отриманні історії.")
-        finally:
-            session.close()
 
     # --- Меню клієнтів ---
     elif data == "clients_menu":
@@ -1690,6 +1774,7 @@ def run_admin_bot():
         fallbacks=[],
         per_chat=True,
         per_user=True,
+        per_message=False,
     )
     app.add_handler(broadcast_conv)
 
@@ -1704,8 +1789,9 @@ def run_admin_bot():
         (filters.TEXT | MEDIA_FILTERS) & ~filters.COMMAND,
         handle_admin_message
     ))
-
+    app.add_handler(CallbackQueryHandler(reset_states_callback, pattern="^reset_states$"))
     # --- 🧩 Callback для решти меню ---
+    app.add_handler(CallbackQueryHandler(view_history_paginated, pattern=r"^history_page:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(admin_menu_callback, pattern=r'^(?!add_admin$|update_admin$|delete_admin$|broadcast$|add_client_menu$|claim:).+'))
 
     logger.info("✅ Запускаю admin bot")
