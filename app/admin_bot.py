@@ -6,6 +6,8 @@ from datetime import datetime
 import html
 import math
 from .pagination.view_history import view_history_paginated
+from sqlalchemy.exc import SQLAlchemyError
+
 
 from dotenv import load_dotenv
 from sqlalchemy import exists
@@ -259,6 +261,10 @@ async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
+        # 🟢 Активуємо режим прямої відповіді
+        context.user_data["write_to_client_mode"] = True
+        context.user_data["target_client_tg"] = message.client_tg_id
+
         logger.info(f"✅ Admin {admin_tg} взяв claim #{claim.id}")
 
     except Exception as e:
@@ -267,8 +273,10 @@ async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("⚠️ Сталася помилка під час обробки запиту.")
         except Exception:
             pass
+
     finally:
         session.close()
+
 
 # ------------------- START CLAIM FLOW -------------------
 
@@ -704,6 +712,17 @@ async def reset_states_callback(update: Update, context: ContextTypes.DEFAULT_TY
             logger.debug("Помилка при роботі з persistence", exc_info=True)
 
         await context.bot.send_message(chat_id, f"✅ Всі стани очищено. Очищено handlers: {cleared_handlers}")
+        try:
+            DELETE_LIMIT = 100
+            messages = await context.bot.get_chat_history(chat_id=chat_id, limit=DELETE_LIMIT)
+            for msg in messages:
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=msg.message_id)
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"⚠️ Не вдалося очистити історію чату: {e}")
 
         # 5) Повернутися в головне меню (start_admin обробляє як message.reply_text або callback)
         # Викликаємо start_admin з оригінальним update (в якому є query.message) — воно відпрацює нормально
@@ -1741,10 +1760,40 @@ async def handle_write_to_client(update: Update, context: ContextTypes.DEFAULT_T
         file_id = update.message.audio.file_id
         file_type = "audio"
 
+    session = SessionLocal()
     client_bot = Bot(token=os.getenv("TELEGRAM_TOKEN_CLIENT"))
 
     try:
-        # Надсилаємо користувачу
+        admin_tg = str(update.effective_user.id)
+        admin_obj = session.query(Admin).filter_by(tg_id=admin_tg).first()
+        client_obj = session.query(Client).filter_by(tg_id=str(tg_target)).first()
+
+        if not admin_obj:
+            await update.message.reply_text("⚠️ Ви не знайдені в базі як адміністратор.")
+            return
+        if not client_obj:
+            await update.message.reply_text("⚠️ Клієнт не знайдений у базі.")
+            return
+
+        company_name = client_obj.company.name if client_obj.company else None
+
+        # 💾 Спочатку записуємо в базу
+        message = Message(
+            client_tg_id=str(tg_target),
+            admin_tg_id=str(admin_tg),
+            direction="out",
+            text=text,
+            file_id=file_id,
+            file_type=file_type,
+            company_snapshot=company_name,
+            created_at=datetime.utcnow(),
+        )
+        session.add(message)
+        session.commit()
+        session.refresh(message)
+        logger.info(f"✅ Повідомлення записано в базу (ID={message.id})")
+
+        # 📤 Потім відправляємо клієнту
         if file_id and file_type:
             if file_type == "photo":
                 await client_bot.send_photo(chat_id=int(tg_target), photo=file_id, caption=text or "")
@@ -1759,14 +1808,20 @@ async def handle_write_to_client(update: Update, context: ContextTypes.DEFAULT_T
         else:
             await client_bot.send_message(chat_id=int(tg_target), text=text or "(без тексту)")
 
-        await update.message.reply_text("✅ Повідомлення надіслано клієнту.")
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Помилка надсилання: {e}")
-        return
+        await update.message.reply_text("✅ Повідомлення надіслано клієнту і збережено в історію.")
 
-    # очищаємо стан
-    context.user_data.pop("write_to_client_mode", None)
-    context.user_data.pop("target_client_tg", None)
+    except Exception as e:
+        session.rollback()
+        logger.exception("❌ Помилка при записі повідомлення в базу:")
+        await update.message.reply_text(f"⚠️ Помилка надсилання або збереження: {e}")
+
+    finally:
+        session.close()
+        context.user_data.pop("write_to_client_mode", None)
+        context.user_data.pop("target_client_tg", None)
+
+
+
 
 async def start_write_to_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Якщо це CallbackQuery (з кнопки)
@@ -1786,56 +1841,6 @@ async def start_write_to_client(update: Update, context: ContextTypes.DEFAULT_TY
     if update.message:
         await update.message.reply_text("Введіть tg_id клієнта або натисніть кнопку.")
         return WRITE_TO_CLIENT
-
-async def handle_write_to_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("write_to_client_mode"):
-        # якщо випадково виклик — ігноруємо (ConversationHandler має фільтрувати, але надійність)
-        return ConversationHandler.END
-
-    tg_target = context.user_data.get("target_client_tg")
-    if not tg_target:
-        await update.message.reply_text("❌ Не вказано клієнта.")
-        return ConversationHandler.END
-
-    text = update.message.caption or (update.message.text.strip() if update.message.text else None)
-    file_id = None
-    file_type = None
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id; file_type = "photo"
-    elif update.message.document:
-        file_id = update.message.document.file_id; file_type = "document"
-    elif update.message.video:
-        file_id = update.message.video.file_id; file_type = "video"
-    elif update.message.voice:
-        file_id = update.message.voice.file_id; file_type = "voice"
-    elif update.message.audio:
-        file_id = update.message.audio.file_id; file_type = "audio"
-
-    client_bot = Bot(token=os.getenv("TELEGRAM_TOKEN_CLIENT"))
-    try:
-        if file_id and file_type:
-            # використовуємо file_id напряму (не з диску)
-            if file_type == "photo":
-                await client_bot.send_photo(chat_id=int(tg_target), photo=file_id, caption=text or "")
-            elif file_type == "document":
-                await client_bot.send_document(chat_id=int(tg_target), document=file_id, caption=text or "")
-            elif file_type == "video":
-                await client_bot.send_video(chat_id=int(tg_target), video=file_id, caption=text or "")
-            elif file_type == "voice":
-                await client_bot.send_voice(chat_id=int(tg_target), voice=file_id, caption=text or "")
-            elif file_type == "audio":
-                await client_bot.send_audio(chat_id=int(tg_target), audio=file_id, caption=text or "")
-        else:
-            await client_bot.send_message(chat_id=int(tg_target), text=text or "(без тексту)")
-
-        await update.message.reply_text("✅ Повідомлення надіслано клієнту.")
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Помилка надсилання: {e}")
-
-    # очищаємо стан
-    context.user_data.pop("write_to_client_mode", None)
-    context.user_data.pop("target_client_tg", None)
-    return ConversationHandler.END
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("write_to_client_mode", None)
