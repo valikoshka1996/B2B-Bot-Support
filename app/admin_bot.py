@@ -40,7 +40,7 @@ INITIAL_ADMIN = os.getenv("INITIAL_ADMIN_ID")
 SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", "support@yourcompany.com")
 
 init_db(initial_admin_tg_id=INITIAL_ADMIN)
-
+WRITE_TO_CLIENT = 1
 # States for adding admin via contact
 ASK_CONTACT = range(1)
 
@@ -1040,14 +1040,40 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             if not clients:
                 await query.message.reply_text("📭 Немає клієнтів.")
                 return
-            text = "*👥 Список клієнтів:*\n"
+
+            await query.message.reply_text("📋 *Список клієнтів:*", parse_mode="Markdown")
+
             for c in clients:
-                cname = session.query(Company).filter_by(id=c.company_id).first()
-                comp_name = cname.name if cname else "—"
-                text += f"- {c.name or '—'} (`{c.tg_id}`) — 🏢 {comp_name}\n"
-            await query.message.reply_text(text, parse_mode="Markdown")
+                company = session.query(Company).filter_by(id=c.company_id).first()
+                comp_name = company.name if company else "—"
+
+                text = (
+                    f"👤 <b>{c.name or '—'}</b>\n"
+                    f"🏢 Компанія: <i>{comp_name}</i>\n"
+                    f"🆔 tg_id: <code>{c.tg_id}</code>"
+                )
+
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✉️ Написати", callback_data=f"write_to_client:{c.tg_id}")]
+                ])
+
+                await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
         finally:
             session.close()
+
+
+    elif data.startswith("write_to_client:"):
+        tg_target = data.split(":", 1)[1]
+        context.user_data["write_to_client_mode"] = True
+        context.user_data["target_client_tg"] = tg_target
+
+        await query.message.reply_text(
+            f"✍️ Введіть повідомлення для клієнта `{tg_target}`.\n"
+            "Можете надіслати текст або медіа. Щоб скасувати — /cancel.",
+            parse_mode="Markdown"
+        )
+        return
 
     # --- Повернення до головного меню ---
     elif data == "back_to_main":
@@ -1686,6 +1712,138 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     return await handle_admin_reply(update, context)
 
+async def handle_write_to_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Режим прямого написання клієнту."""
+    if not context.user_data.get("write_to_client_mode"):
+        return  # пропускаємо, якщо не у цьому режимі
+
+    tg_target = context.user_data.get("target_client_tg")
+    if not tg_target:
+        await update.message.reply_text("❌ Не вказано клієнта для повідомлення.")
+        return
+
+    text = update.message.caption or (update.message.text.strip() if update.message.text else None)
+    file_id, file_type = None, None
+
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        file_type = "photo"
+    elif update.message.document:
+        file_id = update.message.document.file_id
+        file_type = "document"
+    elif update.message.video:
+        file_id = update.message.video.file_id
+        file_type = "video"
+    elif update.message.voice:
+        file_id = update.message.voice.file_id
+        file_type = "voice"
+    elif update.message.audio:
+        file_id = update.message.audio.file_id
+        file_type = "audio"
+
+    client_bot = Bot(token=os.getenv("TELEGRAM_TOKEN_CLIENT"))
+
+    try:
+        # Надсилаємо користувачу
+        if file_id and file_type:
+            if file_type == "photo":
+                await client_bot.send_photo(chat_id=int(tg_target), photo=file_id, caption=text or "")
+            elif file_type == "document":
+                await client_bot.send_document(chat_id=int(tg_target), document=file_id, caption=text or "")
+            elif file_type == "video":
+                await client_bot.send_video(chat_id=int(tg_target), video=file_id, caption=text or "")
+            elif file_type == "voice":
+                await client_bot.send_voice(chat_id=int(tg_target), voice=file_id, caption=text or "")
+            elif file_type == "audio":
+                await client_bot.send_audio(chat_id=int(tg_target), audio=file_id, caption=text or "")
+        else:
+            await client_bot.send_message(chat_id=int(tg_target), text=text or "(без тексту)")
+
+        await update.message.reply_text("✅ Повідомлення надіслано клієнту.")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Помилка надсилання: {e}")
+        return
+
+    # очищаємо стан
+    context.user_data.pop("write_to_client_mode", None)
+    context.user_data.pop("target_client_tg", None)
+
+async def start_write_to_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Якщо це CallbackQuery (з кнопки)
+    if update.callback_query:
+        q = update.callback_query
+        await q.answer()
+        tg = q.data.split(":", 1)[1]
+        context.user_data["write_to_client_mode"] = True
+        context.user_data["target_client_tg"] = tg
+        await q.edit_message_text(
+            f"✍️ Введіть повідомлення (текст або медіа) для клієнта `{tg}`.\nЩоб скасувати, /cancel",
+            parse_mode="Markdown"
+        )
+        return WRITE_TO_CLIENT
+
+    # Якщо команда /write_client (опціонально) — запитай tg_id
+    if update.message:
+        await update.message.reply_text("Введіть tg_id клієнта або натисніть кнопку.")
+        return WRITE_TO_CLIENT
+
+async def handle_write_to_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("write_to_client_mode"):
+        # якщо випадково виклик — ігноруємо (ConversationHandler має фільтрувати, але надійність)
+        return ConversationHandler.END
+
+    tg_target = context.user_data.get("target_client_tg")
+    if not tg_target:
+        await update.message.reply_text("❌ Не вказано клієнта.")
+        return ConversationHandler.END
+
+    text = update.message.caption or (update.message.text.strip() if update.message.text else None)
+    file_id = None
+    file_type = None
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id; file_type = "photo"
+    elif update.message.document:
+        file_id = update.message.document.file_id; file_type = "document"
+    elif update.message.video:
+        file_id = update.message.video.file_id; file_type = "video"
+    elif update.message.voice:
+        file_id = update.message.voice.file_id; file_type = "voice"
+    elif update.message.audio:
+        file_id = update.message.audio.file_id; file_type = "audio"
+
+    client_bot = Bot(token=os.getenv("TELEGRAM_TOKEN_CLIENT"))
+    try:
+        if file_id and file_type:
+            # використовуємо file_id напряму (не з диску)
+            if file_type == "photo":
+                await client_bot.send_photo(chat_id=int(tg_target), photo=file_id, caption=text or "")
+            elif file_type == "document":
+                await client_bot.send_document(chat_id=int(tg_target), document=file_id, caption=text or "")
+            elif file_type == "video":
+                await client_bot.send_video(chat_id=int(tg_target), video=file_id, caption=text or "")
+            elif file_type == "voice":
+                await client_bot.send_voice(chat_id=int(tg_target), voice=file_id, caption=text or "")
+            elif file_type == "audio":
+                await client_bot.send_audio(chat_id=int(tg_target), audio=file_id, caption=text or "")
+        else:
+            await client_bot.send_message(chat_id=int(tg_target), text=text or "(без тексту)")
+
+        await update.message.reply_text("✅ Повідомлення надіслано клієнту.")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Помилка надсилання: {e}")
+
+    # очищаємо стан
+    context.user_data.pop("write_to_client_mode", None)
+    context.user_data.pop("target_client_tg", None)
+    return ConversationHandler.END
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("write_to_client_mode", None)
+    context.user_data.pop("target_client_tg", None)
+    await update.message.reply_text("❌ Режим написання клієнту скасовано.")
+    return ConversationHandler.END
+
+
 
 async def set_admin_commands(app):
     await app.bot.set_my_commands([
@@ -1785,10 +1943,39 @@ def run_admin_bot():
         filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO
     )
 
+    # --- 💬 FSM для відповіді клієнту (рекомендується) ---
+    write_to_client_conv = ConversationHandler(
+        name="write_to_client_conv",
+        entry_points=[
+            CallbackQueryHandler(start_write_to_client, pattern=r"^write_to_client:\d+$"),
+            CommandHandler("write_client", start_write_to_client),  # опціонально
+        ],
+        states={
+            WRITE_TO_CLIENT: [
+                MessageHandler(
+                    (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO)
+                    & ~filters.COMMAND,
+                    handle_write_to_client
+                )
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CallbackQueryHandler(reset_states_callback, pattern="^reset_states$")
+        ],
+        per_chat=True,
+        per_user=True,
+        per_message=False,
+    )
+    app.add_handler(write_to_client_conv)
+
+    # --- Глобальний обробник адмінських повідомлень (залишити після convo-ів) ---
     app.add_handler(MessageHandler(
         (filters.TEXT | MEDIA_FILTERS) & ~filters.COMMAND,
         handle_admin_message
     ))
+
+
     app.add_handler(CallbackQueryHandler(reset_states_callback, pattern="^reset_states$"))
     # --- 🧩 Callback для решти меню ---
     app.add_handler(CallbackQueryHandler(view_history_paginated, pattern=r"^history_page:\d+:\d+$"))
