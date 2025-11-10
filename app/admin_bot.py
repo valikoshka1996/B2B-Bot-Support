@@ -30,6 +30,15 @@ from .utils import (
     update_client, delete_client,
     get_company_history
 )
+import warnings
+from telegram.warnings import PTBUserWarning
+
+# Приглушити тільки ці ворнінги
+warnings.filterwarnings(
+    "ignore",
+    message="If 'per_message=False', 'CallbackQueryHandler' will not be tracked",
+    category=PTBUserWarning
+)
 
 # Load environment variables
 load_dotenv()

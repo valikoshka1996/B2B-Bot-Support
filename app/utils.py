@@ -1,9 +1,10 @@
 from .db import engine, SessionLocal
 from .models import Base, Admin, Company, Client, Message, Claim
 from sqlalchemy.orm import Session
+from sqlalchemy import inspect
 
 def init_db(initial_admin_tg_id: str = None):
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=engine, checkfirst=True)
     session = SessionLocal()
     try:
         if initial_admin_tg_id:
@@ -16,6 +17,7 @@ def init_db(initial_admin_tg_id: str = None):
                 session.rollback()
     finally:
         session.close()
+
 
 # === ADMIN CRUD ===
 def get_admins(session: Session):
